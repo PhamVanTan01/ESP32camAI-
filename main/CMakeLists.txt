@@ -5,4 +5,5 @@ idf_component_register(
         "sdcard_hal.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_timer fatfs esp32-camera console nvs_flash vfs
+    PRIV_REQUIRES spi_flash esp_psram
 )
