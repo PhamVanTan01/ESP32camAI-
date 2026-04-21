@@ -9,12 +9,6 @@
 
 static const char* TAG = "fs_test2";
 
-// Pin assignments for XIAO ESP32S3
-#define PIN_NUM_MISO  8
-#define PIN_NUM_MOSI  9
-#define PIN_NUM_CLK   7
-#define PIN_NUM_CS    21
-
 // 文件系统路径
 #define MOUNT_POINT "/sdcard"
 #define TEST_DIR "d"
@@ -61,18 +55,8 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting extended filesystem test");
 
-    // 初始化SD卡
-    sdcard_config_t sd_config = {
-        .host = SPI2_HOST,
-        .pin_mosi = PIN_NUM_MOSI,
-        .pin_miso = PIN_NUM_MISO,
-        .pin_sck = PIN_NUM_CLK,
-        .pin_cs = PIN_NUM_CS,
-        .freq_khz = 40000,
-    };
-
-    sdcard_t* card = NULL;
-    esp_err_t ret = sdcard_init(&sd_config, &card);
+    sdcard_hal_t sd_hal = {0};
+    esp_err_t ret = sdcard_hal_init(&sd_hal);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize SD card");
         return;
@@ -82,13 +66,14 @@ void app_main(void)
     fs_config_t fs_config = {
         .mount_point = MOUNT_POINT,
         .max_files = 5,
-        .format_if_mount_failed = true
+        .format_if_mount_failed = true,
+        .sdcard = &sd_hal,
     };
 
-    ret = fs_init(card, &fs_config);
+    ret = fs_init(&fs_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize filesystem");
-        sdcard_deinit(card);
+        sdcard_hal_deinit(&sd_hal);
         return;
     }
 
@@ -182,5 +167,5 @@ void app_main(void)
 cleanup:
     // 清理资源
     fs_deinit();
-    sdcard_deinit(card);
+    sdcard_hal_deinit(&sd_hal);
 }

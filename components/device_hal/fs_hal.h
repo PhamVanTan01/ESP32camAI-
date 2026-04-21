@@ -10,7 +10,7 @@ typedef struct {
     const char* mount_point;     // 挂载点路径
     size_t max_files;           // 最大同时打开文件数
     bool format_if_mount_failed; // 挂载失败时是否格式化
-    sdcard_config_t sdcard;     // SD卡配置
+    sdcard_hal_t *sdcard;       // 已初始化的SD卡HAL
 } fs_config_t;
 
 // 文件系统信息
