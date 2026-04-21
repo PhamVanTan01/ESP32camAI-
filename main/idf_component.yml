@@ -1,4 +1,2 @@
 dependencies:
-  esp32-camera:
-    override_path: ../components/esp32-camera
   espressif/esp32-camera: '*'

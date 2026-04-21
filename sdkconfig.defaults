@@ -1,45 +1,53 @@
-# ESP32-S3 specific configuration
-CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
-CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+# Config for GOOUUU ESP32-S3-CAM N16R8 with PSRAM ENABLED (test mode).
+# NOTE: With PSRAM clocked, the onboard microSD slot (no external pull-ups
+# on CMD/D0) may fail to init with ESP_ERR_TIMEOUT (0x107). If that happens
+# and you need SD back, either disable PSRAM again or solder 10 kOhm
+# pull-ups from 3V3 to GPIO 38 (CMD) and GPIO 40 (D0).
 
-# Camera configuration
-CONFIG_ESP32_CAMERA_SUPPORT=y
-CONFIG_ESP32_CAMERA_MODULE_WROVER_KIT=y
-CONFIG_ESP32_CAMERA_JPEG_MODE=y
+CONFIG_IDF_TARGET="esp32s3"
 
-# PSRAM configuration
+# CPU (keep 160 MHz — stable with SDMMC when PSRAM is active)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+
+# Flash: N16 = 16 MB, DIO @ 80 MHz
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# PSRAM: R8 = 8 MB Octal, conservative 40 MHz for signal integrity
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_MEMTEST=y
-CONFIG_SPIRAM_CACHE_WORKAROUND=y
-CONFIG_SPIRAM_BANKSWITCH_ENABLE=y
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
-# FAT Filesystem configuration
+# Camera: keep PSRAM DMA mode DISABLED (default). Turning it on with a large
+# custom fb caused clean-boot SVGA to produce NO-EOI on this board + IDF 5.5
+# combo. Driver falls back to internal-SRAM DMA + CPU copy to PSRAM fb, which
+# is the path that has been proven stable in this project.
+#
+# Keep the 2 MB custom JPEG fb so UXGA/FHD still fit (W*H/5 = 384 KB for UXGA
+# is too tight when scenes have lots of detail).
+# CONFIG_CAMERA_PSRAM_DMA is not set
+CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM=y
+CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE=2097152
+
+# Partition table (single-app large, gives ~1.5 MB for factory app)
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# FAT long file names (for human-readable filenames on SD)
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 CONFIG_FATFS_API_ENCODING_UTF_8=y
 
-# Console configuration
+# Console UART
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 
-# FreeRTOS configuration
+# FreeRTOS
 CONFIG_FREERTOS_HZ=1000
-CONFIG_FREERTOS_UNICORE=n
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=3072
-
-# Partition Table
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
-
-# Flash configuration
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
