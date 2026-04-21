@@ -8,12 +8,14 @@
 #include <errno.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
+#include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
 #include "nvs_flash.h"
@@ -35,6 +37,10 @@
 #endif
 
 static const char *TAG = "video_recorder";
+
+#define PHOTO_BTN_GPIO          GPIO_NUM_0
+#define PHOTO_BTN_ACTIVE_LEVEL  0
+#define PHOTO_BTN_DEBOUNCE_MS   250
 
 #if BOARD_HAS_PDM_MIC
 #define DMA_BUFFER_LEN      1024
@@ -194,6 +200,9 @@ static uint8_t audio_buffer[AUDIO_BUFFER_SIZE];
 #endif
 
 static sdmmc_card_t *s_sd_card = NULL;
+static QueueHandle_t s_photo_btn_queue = NULL;
+static TaskHandle_t s_photo_btn_task = NULL;
+static uint32_t s_last_photo_btn_ms = 0;
 
 static esp_err_t init_sdcard(void)
 {
@@ -784,6 +793,201 @@ restore:
     vTaskDelay(pdMS_TO_TICKS(300));
 }
 
+static void capture_photo_all_resolutions(void)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) {
+        ESP_LOGE(TAG, "capture_photo_all_resolutions: sensor unavailable");
+        return;
+    }
+    if (!s_sd_card) {
+        ESP_LOGE(TAG, "capture_photo_all_resolutions: SD card not available");
+        return;
+    }
+
+    // Preserve runtime video configuration and restore after the test sweep.
+    const framesize_t prev_framesize = g_video.framesize;
+    const int prev_quality = g_video.jpeg_quality;
+    const int prev_width = g_video.width;
+    const int prev_height = g_video.height;
+    const int still_quality = 8;
+    camera_fb_t *fb = NULL;
+    const resolution_entry_t *r = find_resolution("qxga");
+    if (!r) {
+        ESP_LOGE(TAG, "capture_photo_all_resolutions: qxga resolution not available");
+        goto restore;
+    }
+
+    ESP_LOGI(TAG, "BOOT action: fixed capture at qxga");
+
+    if (s->set_framesize(s, r->fs) != 0) {
+        ESP_LOGW(TAG, "Skip %s: set_framesize failed", r->name);
+        goto restore;
+    }
+    if (s->set_quality(s, still_quality) != 0) {
+        ESP_LOGW(TAG, "Skip %s: set_quality(%d) failed", r->name, still_quality);
+        goto restore;
+    }
+
+    // Give sensor time to settle, then drop early unstable frames.
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    for (int warm = 0; warm < 2; warm++) {
+        camera_fb_t *warm_fb = esp_camera_fb_get();
+        if (!warm_fb) {
+            break;
+        }
+        esp_camera_fb_return(warm_fb);
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+
+    fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGW(TAG, "Skip %s: capture failed", r->name);
+        goto restore;
+    }
+    if (fb->format != PIXFORMAT_JPEG) {
+        ESP_LOGW(TAG, "Skip %s: frame format=%d (not JPEG)", r->name, fb->format);
+        esp_camera_fb_return(fb);
+        goto restore;
+    }
+
+    time_t now;
+    struct tm timeinfo;
+    char photo_path[64];
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    uint32_t ms = (uint32_t)((esp_timer_get_time() / 1000ULL) % 1000ULL);
+    snprintf(photo_path, sizeof(photo_path),
+             MOUNT_POINT "/%02d%02d%02d_%03lu_%s.jpg",
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+             (unsigned long)ms, r->name);
+
+    FILE *photo = fopen(photo_path, "wb");
+    if (!photo) {
+        ESP_LOGW(TAG, "Skip %s: fopen failed errno=%d (%s)",
+                 r->name, errno, strerror(errno));
+        esp_camera_fb_return(fb);
+        goto restore;
+    }
+
+    size_t fb_len = fb->len;
+    size_t written = fwrite(fb->buf, 1, fb_len, photo);
+    fclose(photo);
+    esp_camera_fb_return(fb);
+    fb = NULL;
+
+    if (written != fb_len) {
+        ESP_LOGW(TAG, "Skip %s: short write (%u/%u)",
+                 r->name, (unsigned)written, (unsigned)fb_len);
+        goto restore;
+    }
+
+    struct stat st;
+    if (stat(photo_path, &st) == 0) {
+        ESP_LOGI(TAG, "Saved [%s] %dx%d q=%d -> %s (%ld bytes)",
+                 r->name, r->width, r->height, still_quality,
+                 photo_path, (long)st.st_size);
+    } else {
+        ESP_LOGI(TAG, "Saved [%s] %dx%d q=%d -> %s",
+                 r->name, r->width, r->height, still_quality, photo_path);
+    }
+
+restore:
+    if (fb) {
+        esp_camera_fb_return(fb);
+    }
+
+    if (s->set_framesize(s, prev_framesize) != 0) {
+        ESP_LOGW(TAG, "capture_photo_all_resolutions: failed to restore framesize");
+    }
+    if (s->set_quality(s, prev_quality) != 0) {
+        ESP_LOGW(TAG, "capture_photo_all_resolutions: failed to restore quality");
+    }
+    g_video.framesize = prev_framesize;
+    g_video.width = prev_width;
+    g_video.height = prev_height;
+    g_video.jpeg_quality = prev_quality;
+    vTaskDelay(pdMS_TO_TICKS(300));
+}
+
+static void IRAM_ATTR photo_btn_isr_handler(void *arg)
+{
+    if (!s_photo_btn_queue) {
+        return;
+    }
+    uint32_t gpio_num = (uint32_t)(uintptr_t)arg;
+    BaseType_t hp_task_woken = pdFALSE;
+    xQueueSendFromISR(s_photo_btn_queue, &gpio_num, &hp_task_woken);
+    if (hp_task_woken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void photo_btn_task(void *arg)
+{
+    (void)arg;
+    uint32_t gpio_num = 0;
+
+    while (1) {
+        if (xQueueReceive(s_photo_btn_queue, &gpio_num, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        if ((now_ms - s_last_photo_btn_ms) < PHOTO_BTN_DEBOUNCE_MS) {
+            continue;
+        }
+        s_last_photo_btn_ms = now_ms;
+
+        if ((gpio_num_t)gpio_num != PHOTO_BTN_GPIO) {
+            continue;
+        }
+        if (gpio_get_level(PHOTO_BTN_GPIO) != PHOTO_BTN_ACTIVE_LEVEL) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "BOOT button pressed -> capture fixed qxga photo");
+        capture_photo_all_resolutions();
+    }
+}
+
+static esp_err_t init_photo_button(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PHOTO_BTN_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    s_photo_btn_queue = xQueueCreate(8, sizeof(uint32_t));
+    if (!s_photo_btn_queue) {
+        ESP_LOGE(TAG, "Failed to create photo button queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PHOTO_BTN_GPIO, photo_btn_isr_handler,
+                                         (void *)PHOTO_BTN_GPIO));
+
+    BaseType_t task_ok = xTaskCreate(photo_btn_task, "photo_btn_task", 4096,
+                                     NULL, 5, &s_photo_btn_task);
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create photo_btn_task");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Photo button ready on GPIO%d (BOOT)", (int)PHOTO_BTN_GPIO);
+    return ESP_OK;
+}
+
 static void build_vfs_path(char *out, size_t out_sz, const char *user_path)
 {
     if (user_path[0] == '/') {
@@ -1053,6 +1257,12 @@ void app_main(void)
     // Print chip info AFTER all hardware init so the long printf output
     // doesn't push SD-card init timing around on boot.
     print_chip_info();
+
+    esp_err_t btn_ret = init_photo_button();
+    if (btn_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Photo button init failed (%s); command `photo` still works",
+                 esp_err_to_name(btn_ret));
+    }
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
