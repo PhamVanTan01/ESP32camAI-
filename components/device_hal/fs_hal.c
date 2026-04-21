@@ -5,9 +5,6 @@
 #include <errno.h>
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "driver/sdmmc_host.h"
-#include "driver/sdspi_host.h"
 #include "esp_log.h"
 #include "sdcard_hal.h"
 #include "fs_hal.h"
@@ -15,7 +12,7 @@
 static const char* TAG = "fs_hal";
 static char s_mount_point[ESP_VFS_PATH_MAX] = { 0 };
 static bool s_is_mounted = false;
-static sdcard_t* s_card = NULL;
+static sdcard_hal_t* s_card = NULL;
 
 // 设置合适的路径长度，FAT文件系统支持更长的路径
 #define FS_MAX_PATH_LEN 256
@@ -85,65 +82,14 @@ esp_err_t fs_init(const fs_config_t* config) {
     // 保存挂载点
     strlcpy(s_mount_point, config->mount_point, sizeof(s_mount_point));
 
-    ESP_LOGI(TAG, "Initializing SD card");
-    ESP_LOGI(TAG, "MOSI: %d, MISO: %d, SCK: %d, CS: %d", 
-             config->sdcard.pin_mosi, config->sdcard.pin_miso, 
-             config->sdcard.pin_sck, config->sdcard.pin_cs);
-
-    // 初始化SD卡
-    esp_err_t ret = sdcard_init(&config->sdcard, &s_card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SD card");
-        return ret;
-    }
-
-    // 获取并显示SD卡信息
-    sdcard_info_t card_info;
-    ret = sdcard_get_info(s_card, &card_info);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "SD card info:");
-        ESP_LOGI(TAG, "- Type: %d", card_info.type);
-        ESP_LOGI(TAG, "- Capacity: %llu bytes", card_info.capacity_bytes);
-    }
-
-    ESP_LOGI(TAG, "Initializing filesystem at %s", config->mount_point);
-
-    // 挂载配置
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = config->format_if_mount_failed,
-        .max_files = config->max_files,
-        .allocation_unit_size = 16 * 1024,  // 16KB clusters
-        .disk_status_check_enable = true    // 启用磁盘状态检查
-    };
-
-    ESP_LOGI(TAG, "Mounting filesystem with following config:");
-    ESP_LOGI(TAG, "- Mount point: %s", config->mount_point);
-    ESP_LOGI(TAG, "- Max files: %d", mount_config.max_files);
-    ESP_LOGI(TAG, "- Format if mount failed: %d", mount_config.format_if_mount_failed);
-    ESP_LOGI(TAG, "- Allocation unit size: %d", mount_config.allocation_unit_size);
-
-    // 准备SDMMC主机配置
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = s_card->spi;
-    host.max_freq_khz = s_card->sdcard->max_freq_khz;
-
-    // 准备SDSPI设备配置
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = s_card->pin_cs;
-    slot_config.host_id = s_card->host;
-
-    // 挂载文件系统
-    ret = esp_vfs_fat_sdspi_mount(config->mount_point, &host, &slot_config, &mount_config, &s_card->sdcard);
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s)", esp_err_to_name(ret));
-        }
-        sdcard_deinit(s_card);
+    s_card = config->sdcard;
+    if (!sdcard_hal_is_ready(s_card)) {
+        ESP_LOGE(TAG, "SD card HAL is not ready");
         s_mount_point[0] = '\0';
-        return ret;
+        return ESP_ERR_INVALID_STATE;
     }
+
+    ESP_LOGI(TAG, "Using mounted filesystem at %s", config->mount_point);
 
     // 确保挂载点目录存在
     struct stat st;
@@ -153,8 +99,6 @@ esp_err_t fs_init(const fs_config_t* config) {
         if (mkdir(config->mount_point, 0777) != 0) {
             ESP_LOGE(TAG, "Failed to create mount point directory: %s (errno: %d, %s)", 
                     config->mount_point, errno, strerror(errno));
-            esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
-            sdcard_deinit(s_card);
             s_mount_point[0] = '\0';
             return ESP_FAIL;
         }
@@ -175,8 +119,6 @@ esp_err_t fs_init(const fs_config_t* config) {
         ESP_LOGI(TAG, "Test file already exists, attempting to delete");
         if (unlink(test_path) != 0) {
             ESP_LOGE(TAG, "Failed to delete existing test file (errno: %d, %s)", errno, strerror(errno));
-            esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
-            sdcard_deinit(s_card);
             s_mount_point[0] = '\0';
             return ESP_FAIL;
         }
@@ -200,8 +142,6 @@ esp_err_t fs_init(const fs_config_t* config) {
         } else {
             ESP_LOGE(TAG, "Failed to open directory (errno: %d, %s)", errno, strerror(errno));
         }
-        esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
-        sdcard_deinit(s_card);
         s_mount_point[0] = '\0';
         return ESP_FAIL;
     }
@@ -211,8 +151,6 @@ esp_err_t fs_init(const fs_config_t* config) {
         ESP_LOGE(TAG, "Failed to write to test file (errno: %d, %s)", errno, strerror(errno));
         fclose(fp);
         unlink(test_path);
-        esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
-        sdcard_deinit(s_card);
         s_mount_point[0] = '\0';
         return ESP_FAIL;
     }
@@ -224,8 +162,6 @@ esp_err_t fs_init(const fs_config_t* config) {
     ESP_LOGI(TAG, "Verifying file creation...");
     if (stat(test_path, &st) != 0) {
         ESP_LOGE(TAG, "File does not exist after creation (errno: %d, %s)", errno, strerror(errno));
-        esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
-        sdcard_deinit(s_card);
         s_mount_point[0] = '\0';
         return ESP_FAIL;
     }
@@ -244,16 +180,8 @@ esp_err_t fs_deinit(void) {
         return ESP_OK;  // 如果没有挂载，直接返回成功
     }
 
-    // 卸载文件系统
-    esp_err_t ret = esp_vfs_fat_sdcard_unmount(s_mount_point, s_card->sdcard);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to unmount filesystem");
-        return ret;
-    }
-
     s_is_mounted = false;
     s_mount_point[0] = '\0';
-    sdcard_deinit(s_card);
     s_card = NULL;
     return ESP_OK;
 }
