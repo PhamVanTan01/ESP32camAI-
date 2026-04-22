@@ -15,6 +15,9 @@
 #include "esp_timer.h"
 #include "audio_hal.h"
 #include "camera_hal.h"
+#include "ipc.h"
+#include "task_capture.h"
+#include "task_writer.h"
 
 static app_video_config_t g_video = {
     .framesize = FRAMESIZE_SVGA,
@@ -121,7 +124,7 @@ static camera_fb_t *still_capture_two_phase(const char *ctx, sensor_t *s, frames
 
 esp_err_t app_video_init(void)
 {
-    return ESP_OK;
+    return ipc_init();
 }
 
 void app_video_set_sdcard(sdcard_hal_t *sdcard)
@@ -200,62 +203,46 @@ esp_err_t app_video_record(void)
 
     const app_video_config_t *cfg = app_video_get_config();
     uint32_t init_fps = (cfg->frame_interval_ms > 0) ? (1000U / cfg->frame_interval_ms) : 10U;
-    avi_writer_t *avi = NULL;
-    if (avi_begin(video_path, cfg->width, cfg->height, init_fps, &avi) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize AVI writer for %s", video_path);
+    xEventGroupClearBits(g_record_events, EVT_RUNNING | EVT_STOP_REQ | EVT_WRITER_DONE | EVT_CAPTURE_DONE);
+
+    writer_config_t wcfg = {
+        .video_path = video_path,
+        .width = cfg->width,
+        .height = cfg->height,
+        .init_fps = init_fps,
+    };
+    if (task_writer_start(&wcfg) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start task_writer");
         return ESP_FAIL;
     }
 #if BOARD_HAS_PDM_MIC
     FILE *audio_file = fopen(audio_path, "wb");
     if (!audio_file) {
         ESP_LOGE(TAG, "Failed to open audio file %s: errno=%d (%s)", audio_path, errno, strerror(errno));
-        avi_abort(avi);
+        task_capture_stop();
         return ESP_FAIL;
     }
 #endif
-    uint64_t start_time = esp_timer_get_time();
-    const uint64_t record_length = (uint64_t)cfg->duration_sec * 1000000ULL;
-    uint32_t write_errors = 0;
-    uint32_t capture_fail_streak = 0;
-    const uint32_t capture_fail_streak_abort = 50;
-    while ((esp_timer_get_time() - start_time) < record_length) {
-        uint64_t frame_start = esp_timer_get_time();
-        camera_fb_t *fb = camera_hal_get_frame();
-        if (!fb) {
-            capture_fail_streak++;
-            if (capture_fail_streak >= capture_fail_streak_abort) {
-                ESP_LOGE(TAG, "Aborting record after %u capture failures", capture_fail_streak);
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-        capture_fail_streak = 0;
-        if (fb->format != PIXFORMAT_JPEG) {
-            camera_hal_return_frame(fb);
-            break;
-        }
-        if (avi_write_frame(avi, fb->buf, fb->len) != ESP_OK) {
-            write_errors++;
-        }
-        camera_hal_return_frame(fb);
-#if BOARD_HAS_PDM_MIC
-        (void)audio_hal_record_chunk(audio_file);
-#endif
-        if (cfg->frame_interval_ms > 0) {
-            uint64_t elapsed_ms = (esp_timer_get_time() - frame_start) / 1000ULL;
-            if (elapsed_ms < cfg->frame_interval_ms) {
-                vTaskDelay(pdMS_TO_TICKS(cfg->frame_interval_ms - elapsed_ms));
-            }
-        }
+    uint64_t record_length = (uint64_t)cfg->duration_sec * 1000000ULL;
+    if (task_capture_start(record_length, cfg->frame_interval_ms) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start task_capture");
+        return ESP_FAIL;
     }
-    uint64_t elapsed_us = esp_timer_get_time() - start_time;
-    uint32_t total_frames = avi_frame_count(avi);
-    esp_err_t end_res = avi_end(avi, elapsed_us);
+
+    esp_err_t capture_ret = task_capture_wait_done(cfg->duration_sec * 1000U + 3000U);
+    if (capture_ret != ESP_OK) {
+        ESP_LOGW(TAG, "capture wait timeout, requesting stop");
+        task_capture_stop();
+        (void)task_capture_wait_done(2000);
+    }
+
+    esp_err_t writer_ret = task_writer_wait_done(10000);
     struct stat st;
 #if BOARD_HAS_PDM_MIC
     fclose(audio_file);
 #endif
+    uint32_t total_frames = task_writer_get_frame_count();
+    uint32_t write_errors = task_writer_get_write_errors();
     ESP_LOGI(TAG, "Recording finished: frames=%" PRIu32 " write_errors=%" PRIu32, total_frames, write_errors);
     if (stat(video_path, &st) == 0) {
         ESP_LOGI(TAG, "Video saved: %s (%ld bytes)", video_path, (long)st.st_size);
@@ -269,7 +256,7 @@ esp_err_t app_video_record(void)
         ESP_LOGI(TAG, "Audio saved: %s", audio_path);
     }
 #endif
-    return (end_res == ESP_OK) ? ESP_OK : ESP_FAIL;
+    return (writer_ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t app_video_capture_photo(void)

@@ -1,5 +1,8 @@
 idf_component_register(
     SRCS
+        "ipc.c"
+        "task_capture.c"
+        "task_writer.c"
         "app_video.c"
         "app_cli.c"
         "app_events.c"
