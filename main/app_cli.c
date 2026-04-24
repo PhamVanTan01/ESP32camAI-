@@ -1,15 +1,13 @@
 #include "app_cli.h"
 
-#include <dirent.h>
-#include <errno.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
-#include "bsp_board.h"
-#include "file_transfer.h"
 #include "app_video.h"
+#include "camera_hal.h"
+#include "task_media_workers.h"
+#include "esp_camera_af.h"
 #include "esp_console.h"
 #include "esp_vfs_dev.h"
 #include "linenoise/linenoise.h"
@@ -18,13 +16,83 @@
 
 static esp_console_repl_t *s_repl = NULL;
 
+static int cmd_af_init(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    sensor_t *s = camera_hal_get_sensor();
+    if (!s) {
+        printf("Camera sensor is not ready\n");
+        return 0;
+    }
+    if (!esp_camera_af_is_supported(s)) {
+        printf("Autofocus is not supported by current sensor PID=0x%04x\n", s->id.PID);
+        return 0;
+    }
+    esp_camera_af_config_t af_cfg = {
+        .mode = ESP_CAMERA_AF_MODE_AUTO,
+        .timeout_ms = 2000,
+    };
+    esp_err_t ret = esp_camera_af_init(s, &af_cfg);
+    if (ret != ESP_OK) {
+        printf("AF init failed: %s\n", esp_err_to_name(ret));
+        return 0;
+    }
+    printf("AF initialized (mode=auto)\n");
+    return 0;
+}
+
+static int cmd_af_trigger(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    sensor_t *s = camera_hal_get_sensor();
+    if (!s) {
+        printf("Camera sensor is not ready\n");
+        return 0;
+    }
+    if (!esp_camera_af_is_supported(s)) {
+        printf("Autofocus is not supported by current sensor PID=0x%04x\n", s->id.PID);
+        return 0;
+    }
+    esp_err_t ret = esp_camera_af_trigger(s);
+    if (ret != ESP_OK) {
+        printf("AF trigger failed: %s\n", esp_err_to_name(ret));
+        return 0;
+    }
+    printf("AF trigger sent\n");
+    return 0;
+}
+
+static int cmd_af_status(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    sensor_t *s = camera_hal_get_sensor();
+    if (!s) {
+        printf("Camera sensor is not ready\n");
+        return 0;
+    }
+    if (!esp_camera_af_is_supported(s)) {
+        printf("Autofocus is not supported by current sensor PID=0x%04x\n", s->id.PID);
+        return 0;
+    }
+    esp_camera_af_status_t st = {0};
+    esp_err_t ret = esp_camera_af_get_status(s, &st);
+    if (ret != ESP_OK) {
+        printf("AF status failed: %s\n", esp_err_to_name(ret));
+        return 0;
+    }
+    printf("AF status: raw=0x%02x focused=%u busy=%u\n", st.raw, st.focused, st.busy);
+    return 0;
+}
+
 static int cmd_record(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    if (app_video_record() != ESP_OK) {
-        printf("record failed\n");
-    }
+    printf("Triggering video recording (worker task)...\n");
+    media_workers_notify_record();
     return 0;
 }
 
@@ -32,9 +100,8 @@ static int cmd_photo(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    if (app_video_capture_photo() != ESP_OK) {
-        printf("photo failed\n");
-    }
+    printf("Triggering photo capture (worker task)...\n");
+    media_workers_notify_photo();
     return 0;
 }
 
@@ -44,9 +111,8 @@ static int cmd_transfer(int argc, char **argv)
         printf("Usage: transfer <filename>\n");
         return 0;
     }
-    if (file_transfer_hex(BSP_SD_MOUNT_POINT, argv[1]) != ESP_OK) {
-        printf("transfer failed\n");
-    }
+    media_workers_notify_transfer(argv[1]);
+    printf("Queued transfer job: %s\n", argv[1]);
     return 0;
 }
 
@@ -54,29 +120,8 @@ static int cmd_ls(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    DIR *dir = opendir(BSP_SD_MOUNT_POINT);
-    if (!dir) {
-        printf("Error: Could not open %s (errno=%d: %s)\n",
-               BSP_SD_MOUNT_POINT, errno, strerror(errno));
-        return 0;
-    }
-
-    printf("Files on SD (%s):\n", BSP_SD_MOUNT_POINT);
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (ent->d_type == DT_DIR) {
-            continue;
-        }
-        char full[288];
-        snprintf(full, sizeof(full), "%s/%s", BSP_SD_MOUNT_POINT, ent->d_name);
-        struct stat st;
-        if (stat(full, &st) == 0) {
-            printf("%s\t%ld bytes\n", ent->d_name, (long)st.st_size);
-        } else {
-            printf("%s\t?\n", ent->d_name);
-        }
-    }
-    closedir(dir);
+    media_workers_notify_ls();
+    printf("Queued ls job\n");
     return 0;
 }
 
@@ -100,17 +145,8 @@ static int cmd_show(int argc, char **argv)
     return 0;
 }
 
-static int cmd_set(int argc, char **argv)
+static int cmd_set_impl(int argc, char **argv)
 {
-    if (argc != 3) {
-        printf("Usage:\n");
-        printf("  set resolution <qqvga|qvga|cif|hvga|vga|svga|xga|hd|sxga|uxga|fhd|qxga>\n");
-        printf("  set quality <0..63>          (lower = better quality, bigger file)\n");
-        printf("  set duration <1..3600>       (seconds)\n");
-        printf("  set fps <0..30>              (0 = max, else cap)\n");
-        return 0;
-    }
-
     if (strcmp(argv[1], "resolution") == 0) {
         app_video_config_t *cfg = app_video_get_config_mutable();
         const app_video_resolution_t *r = app_video_find_resolution(argv[2]);
@@ -169,6 +205,23 @@ static int cmd_set(int argc, char **argv)
                argv[1]);
     }
     return 0;
+}
+
+static int cmd_set(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("Usage:\n");
+        printf("  set resolution <qqvga|qvga|cif|hvga|vga|svga|xga|hd|sxga|uxga|fhd|qxga>\n");
+        printf("  set quality <0..63>          (lower = better quality, bigger file)\n");
+        printf("  set duration <1..3600>       (seconds)\n");
+        printf("  set fps <0..30>              (0 = max, else cap)\n");
+        return 0;
+    }
+
+    app_video_lock();
+    int rc = cmd_set_impl(argc, argv);
+    app_video_unlock();
+    return rc;
 }
 
 esp_err_t app_cli_init(void)
@@ -233,6 +286,27 @@ esp_err_t app_cli_init(void)
     cmd.help = "Set a video parameter (run `set` with no args for usage)";
     cmd.hint = "<param> <value>";
     cmd.func = cmd_set;
+    ret = esp_console_cmd_register(&cmd);
+    if (ret != ESP_OK) return ret;
+
+    cmd.command = "af_init";
+    cmd.help = "Initialize autofocus firmware (OV5640 only)";
+    cmd.hint = NULL;
+    cmd.func = cmd_af_init;
+    ret = esp_console_cmd_register(&cmd);
+    if (ret != ESP_OK) return ret;
+
+    cmd.command = "af_trigger";
+    cmd.help = "Trigger one-shot autofocus";
+    cmd.hint = NULL;
+    cmd.func = cmd_af_trigger;
+    ret = esp_console_cmd_register(&cmd);
+    if (ret != ESP_OK) return ret;
+
+    cmd.command = "af_status";
+    cmd.help = "Read autofocus status";
+    cmd.hint = NULL;
+    cmd.func = cmd_af_status;
     ret = esp_console_cmd_register(&cmd);
     if (ret != ESP_OK) return ret;
 

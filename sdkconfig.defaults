@@ -24,16 +24,20 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 
+# Map .text/.rodata to PSRAM so code keeps running when internal flash is busy
+# (e.g. SD card on shared MSPI). Revisit if you see instability or larger bin.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
 # Camera: keep PSRAM DMA mode DISABLED (default). Turning it on with a large
 # custom fb caused clean-boot SVGA to produce NO-EOI on this board + IDF 5.5
 # combo. Driver falls back to internal-SRAM DMA + CPU copy to PSRAM fb, which
 # is the path that has been proven stable in this project.
 #
-# Keep the 2 MB custom JPEG fb so UXGA/FHD still fit (W*H/5 = 384 KB for UXGA
-# is too tight when scenes have lots of detail).
+# Audit mode: switch to AUTO JPEG frame-size to compare memory behavior
+# against previous CUSTOM=2MB strategy.
 # CONFIG_CAMERA_PSRAM_DMA is not set
-CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM=y
-CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE=2097152
+CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_AUTO=y
+CONFIG_CAMERA_AF_SUPPORT=y
 
 # Partition table (single-app large, gives ~1.5 MB for factory app)
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
